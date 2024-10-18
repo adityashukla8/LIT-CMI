@@ -7,6 +7,7 @@ from lit_nlp.api import types as lit_types
 from lit_nlp.api import dataset as lit_dataset
 from lit_nlp import server_flags
 from lit_nlp.api import layout
+from lit_nlp.components import gradient_maps, shap_explainer
 
 from typing import Optional
 
@@ -22,6 +23,7 @@ import pickle
 
 from scipy.optimize import minimize
 from sklearn.metrics import cohen_kappa_score
+from sklearn.decomposition import PCA
 
 from ipdb import set_trace as ipdb
 # }}} 
@@ -61,7 +63,8 @@ class LitDataset(lit_dataset.Dataset):
     def __init__(self, path):
         self.data = pd.read_parquet(path)
         self.feature_columns = [col for col in self.data]
-        self._examples = self.data[self.feature_columns].to_dict(orient='records')
+        # self._examples = self.data[self.feature_columns].to_dict(orient='records')
+        self._examples = self.data.to_dict(orient='records')
         # print(f"data features: {len(self.feature_columns)}")
 
     def spec(self):
@@ -77,27 +80,38 @@ class LitDataset(lit_dataset.Dataset):
 
 
 class LitModel(lit_model.Model):
-    def __init__(self, model):
+    def __init__(self, model, n_components=3):
         self.model = model
+        self.pca = PCA(n_components=n_components)
 
     def input_spec(self):
         return {col: lit_types.Scalar() for col in self.model.feature_names_in_}
 
     def output_spec(self):
-        return {"sii": lit_types.RegressionScore()}
+        return {
+            # "sii": lit_types.CategoryLabel(),
+            "sii": lit_types.MulticlassPreds(vocab=[0,1,2,3], parent='sii'),
+            "pca_output": lit_types.Embeddings(),
+            # "probabilities": lit_types.MulticlassPreds(vocab=[0, 1, 2, 3], null_idx=0, parent='sii', threshold=0.5),  # Add probability outputs
+        }
 
     def predict(self, inputs):
         # print(f"INPUTS TYPE: {type(inputs)}, \n{type(inputs[0]['sii'])}\n\n")
         # print(f"model feature names {len(self.model.feature_names_in_)}: {self.model.feature_names_in_}\n")
+        # ipdb()
         inputs_array = np.array([[example[col] for col in self.model.feature_names_in_] for example in inputs])
         # print(f'model input array shape: {inputs_array.shape}')
-        val_y = np.array([example['sii'] for example in inputs])
+        # ipdb()
+        # val_y = np.array([example['sii'] for example in inputs])
         val_predictions = self.model.predict(inputs_array)
-        predictions_minimized_thresholds = minimize(evaluate_pred, x0=[0.5, 1.5, 2.5], args=(val_y, val_predictions), method='Nelder-Mead')
-        rounded_predictions = threshold_rounder(val_predictions, predictions_minimized_thresholds.x)
+        rounded_predictions = val_predictions.astype(int)
+        # predictions_minimized_thresholds = minimize(evaluate_pred, x0=[0.5, 1.5, 2.5], args=(val_y, val_predictions), method='Nelder-Mead')
+        # rounded_predictions = threshold_rounder(val_predictions, predictions_minimized_thresholds.x)
         # print(f'PREDICTIONS: {type(predictions)}, {len(predictions)}')
 
-        return [{"sii": float(pred)} for pred in rounded_predictions]
+        pca_output = self.pca.fit_transform(inputs_array)
+
+        return [{"sii": [float(pred)], "pca_output": pca_output.tolist()} for pred, pca_output in zip(rounded_predictions, pca_output)]
 
 
 def get_wsgi_app() -> Optional[dev_server.LitServerType]:
@@ -124,7 +138,9 @@ def main(argv: Sequence[str]) -> Optional[dev_server.LitServerType]:
     lit_demo = dev_server.Server(
         models=models, 
         datasets=data,
-        # layouts=CUSTOM_LAYOUTS, 
+        # interpreters={"gradientmaps": gradient_maps.IntegratedGradients(), "shap": shap_explainer.TabularShapExplainer()},
+        # interpreters={"shap": shap_explainer.TabularShapExplainer()},
+        layouts=CUSTOM_LAYOUTS, 
         **server_flags.get_flags()
     )
     
